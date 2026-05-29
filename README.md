@@ -66,6 +66,7 @@ The built-in console is designed to work without a separate frontend build step.
 
 Main sections:
 
+- `当前使用模型`: shows the active text, image, and ASR models and their provider base URLs.
 - `一键蒸馏`: paste a homepage URL, choose platform, set item count, and start a background job.
 - `知识库`: select a collected profile and inspect recently collected posts.
 - `模型/API 设置`: configure providers from the browser without editing `.env`.
@@ -74,6 +75,8 @@ Main sections:
 
 Provider settings saved in the UI are stored in local SQLite under `SKILLANYTHING_HOME`. API keys
 and cookies are never echoed back to the page; the UI only shows whether a secret is configured.
+The header contains a direct `设置模型/API` entry so new users can configure providers before
+running their first distillation.
 
 Recommended Qwen/DashScope-compatible values:
 

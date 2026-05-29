@@ -443,6 +443,10 @@ _INDEX_HTML = """
       padding: 22px 28px;
       border-bottom: 1px solid var(--line);
       background: var(--panel);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
     }
     h1 {
       margin: 0 0 6px;
@@ -454,6 +458,27 @@ _INDEX_HTML = """
       margin: 0;
       color: var(--muted);
       font-size: 14px;
+    }
+    .header-copy {
+      min-width: 280px;
+    }
+    .header-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+    }
+    .header-actions a {
+      display: inline-flex;
+      align-items: center;
+      min-height: 38px;
+      border-radius: 6px;
+      padding: 9px 12px;
+      background: #e8eef8;
+      color: #183153;
+      font-size: 14px;
+      font-weight: 650;
+      text-decoration: none;
     }
     main {
       max-width: 1120px;
@@ -577,6 +602,36 @@ _INDEX_HTML = """
       color: var(--muted);
       font-size: 12px;
     }
+    .model-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+    }
+    .model-card {
+      background: #f8fafc;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      min-height: 92px;
+    }
+    .model-card strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .model-card span {
+      display: block;
+      font-size: 15px;
+      font-weight: 700;
+      word-break: break-word;
+    }
+    .model-card small {
+      display: block;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
     .full { grid-column: 1 / -1; }
     .stack { display: grid; gap: 14px; }
     .hint { color: var(--muted); font-size: 12px; line-height: 1.5; }
@@ -594,19 +649,51 @@ _INDEX_HTML = """
     }
     .source-item a { color: var(--accent); text-decoration: none; }
     @media (max-width: 860px) {
+      header { align-items: flex-start; flex-direction: column; }
+      .header-actions { justify-content: flex-start; }
       main { grid-template-columns: 1fr; padding: 14px; }
       .row { grid-template-columns: 1fr; }
       .meta { grid-template-columns: 1fr; }
+      .model-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
   <header>
-    <h1>SkillAnything Local</h1>
-    <p>输入主页链接，后台采集、蒸馏、导出；随后对知识库问答或提取主题 Skill。</p>
+    <div class="header-copy">
+      <h1>SkillAnything Local</h1>
+      <p>输入主页链接，后台采集、蒸馏、导出；随后对知识库问答或提取主题 Skill。</p>
+    </div>
+    <nav class="header-actions" aria-label="主要操作">
+      <a href="#settings-panel">设置模型/API</a>
+      <a href="#distill-panel">开始蒸馏</a>
+      <a href="#qa-panel">知识库问答</a>
+    </nav>
   </header>
   <main>
-    <section>
+    <section class="full">
+      <h2>当前使用模型</h2>
+      <div class="model-grid">
+        <div class="model-card">
+          <strong>文本模型</strong>
+          <span id="currentLlmModel">加载中</span>
+          <small id="currentLlmProvider">用于蒸馏和知识库问答</small>
+        </div>
+        <div class="model-card">
+          <strong>图片模型</strong>
+          <span id="currentVisionModel">加载中</span>
+          <small id="currentVisionProvider">用于图片 OCR 和视觉理解</small>
+        </div>
+        <div class="model-card">
+          <strong>语音模型</strong>
+          <span id="currentAsrModel">加载中</span>
+          <small id="currentAsrProvider">用于音频/视频语音转写</small>
+        </div>
+      </div>
+      <p class="hint" id="configStatus">配置状态加载中。</p>
+    </section>
+
+    <section id="distill-panel">
       <h2>一键蒸馏</h2>
       <label for="source">主页链接</label>
       <input id="source" placeholder="https://xueqiu.com/u/2445021949" />
@@ -646,7 +733,6 @@ _INDEX_HTML = """
         <button class="secondary" onclick="loadProfiles()">刷新 Profile</button>
       </div>
       <div id="status" class="status">等待任务。</div>
-      <p class="hint" id="configStatus">配置状态加载中。</p>
     </section>
 
     <section>
@@ -664,7 +750,7 @@ _INDEX_HTML = """
       </div>
     </section>
 
-    <section class="full">
+    <section class="full" id="settings-panel">
       <h2>模型/API 设置</h2>
       <div class="row">
         <div>
@@ -727,7 +813,7 @@ _INDEX_HTML = """
       <div id="settingsStatus" class="status">设置不会在页面回显 API Key。</div>
     </section>
 
-    <section>
+    <section id="qa-panel">
       <h2>问答</h2>
       <label for="question">问题</label>
       <textarea id="question" placeholder="例如：某个帖子说了什么？他如何分析美股风险？"></textarea>
@@ -798,17 +884,46 @@ _INDEX_HTML = """
 
     async function loadConfig() {
       try {
-        const data = await getJson("/config/status");
+        const data = await getJson("/settings");
         const items = [
-          "LLM " + (data.llm_configured ? "已配置" : "未配置"),
-          "Vision " + (data.vision_configured ? "已配置" : "未配置"),
-          "ASR " + (data.asr_configured ? "已配置" : "未配置"),
-          "雪球 Cookie " + (data.xueqiu_cookie_configured ? "已配置" : "未配置"),
+          "文本模型 " + (data.llm.api_key_set ? "已配置" : "未配置"),
+          "图片模型 " + (data.vision.api_key_set ? "已配置" : "未配置"),
+          "语音模型 " + (data.asr.api_key_set ? "已配置" : "未配置"),
+          "雪球 Cookie " + (data.xueqiu.cookie_set ? "已配置" : "未配置"),
         ];
         document.getElementById("configStatus").textContent = items.join(" / ");
+        renderCurrentModels(data);
       } catch (err) {
         document.getElementById("configStatus").textContent = err.message;
       }
+    }
+
+    function providerLabel(baseUrl) {
+      if (!baseUrl) return "未配置 Base URL";
+      try {
+        const host = new URL(baseUrl).host;
+        if (host.includes("dashscope")) return "DashScope / OpenAI-compatible";
+        if (host.includes("siliconflow")) return "SiliconFlow / OpenAI-compatible";
+        if (host.includes("volc")) return "Volcengine / OpenAI-compatible";
+        return host;
+      } catch {
+        return baseUrl;
+      }
+    }
+
+    function renderCurrentModels(data) {
+      const llmModel = data.llm.model || "未设置";
+      const visionModel = data.vision.model || "未设置";
+      const asrModel = data.asr.model || "未设置";
+      document.getElementById("currentLlmModel").textContent = llmModel;
+      document.getElementById("currentVisionModel").textContent = visionModel;
+      document.getElementById("currentAsrModel").textContent = asrModel;
+      document.getElementById("currentLlmProvider").textContent =
+        providerLabel(data.llm.base_url) + "；用于蒸馏和知识库问答";
+      document.getElementById("currentVisionProvider").textContent =
+        providerLabel(data.vision.base_url) + "；用于图片 OCR 和视觉理解";
+      document.getElementById("currentAsrProvider").textContent =
+        providerLabel(data.asr.base_url) + "；用于音频/视频语音转写";
     }
 
     async function loadSettings() {
@@ -830,6 +945,7 @@ _INDEX_HTML = """
           data.asr.api_key_set ? "已设置，留空不修改" : "未设置";
         document.getElementById("xueqiuCookie").placeholder =
           data.xueqiu.cookie_set ? "已设置，留空不修改" : "未设置";
+        renderCurrentModels(data);
         showStatus("settingsStatus", "设置已加载。", "ok");
       } catch (err) {
         showStatus("settingsStatus", err.message, "error");
