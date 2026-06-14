@@ -232,3 +232,67 @@ credentials. They are intentionally ignored by Git and should not be included in
 - `package`: Skill package writer and linter.
 - `qa`: knowledge-base Q&A.
 - `web`: local FastAPI API and built-in console.
+
+## SkillAnything v1 Workbench
+
+This repository now includes an additive v1 architecture that keeps the old CLI/API compatible while
+adding a clearer three-layer pipeline:
+
+- Data source layer: existing connectors are adapted upward into `SourceDocument` and `Corpus` IR.
+  Custom sources can implement the `SourceAdapter` protocol in `skillanything/sources/base.py`.
+- Distillation layer: `CapabilityDistillationPipeline` turns a corpus into typed `Capability`
+  records. It supports autonomous discovery and user-defined capability extraction through a focus,
+  capability type, and optional schema.
+- Skill packaging layer: `SkillPackExporter` exports the same `SkillPack` IR to `codex-skill`,
+  `openai-skill`, `claude-skill`, `claude-project-bundle`, or `json-ir`.
+
+Core IR and services:
+
+- `skillanything/ir.py`: `SourceDocument`, `Corpus`, `Capability`, `SkillPack`.
+- `skillanything/sources/`: normalized data-source adapter contract.
+- `skillanything/distill/pipeline.py`: capability distillation orchestration.
+- `skillanything/package/exporters/`: multi-platform exporters.
+- `skillanything/storage/repository.py`: additive tables for collection runs, corpora,
+  capabilities, evidence links, skill packs, export artifacts, and richer jobs.
+
+New CLI examples:
+
+```powershell
+sa build-corpus <profile_id> --goal "提取产业链研究方法"
+sa extract-capability <profile_id> "中国 A 股产业链相关性挖掘" --type chain_relevance_mining
+sa capabilities --profile-id <profile_id>
+sa create-pack <capability_id> --target codex-skill --target claude-skill
+sa export-pack <pack_id> --target claude-project-bundle
+```
+
+New v1 API examples:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8091/api/v1/sources/connectors
+
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8091/api/v1/capabilities:extract `
+  -ContentType application/json `
+  -Body '{"profile_id":"<profile_id>","focus":"中国 A 股产业链相关性挖掘","capability_type":"chain_relevance_mining"}'
+
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8091/api/v1/packs/<pack_id>/exports `
+  -ContentType application/json `
+  -Body '{"target":"json-ir"}'
+```
+
+Frontend workbench:
+
+```powershell
+# Backend
+sa ui --host 127.0.0.1 --port 8091
+
+# Frontend
+cd frontend
+npm install
+$env:VITE_SKILLANYTHING_API_PROXY="http://127.0.0.1:8091"
+npm run dev
+```
+
+Open `http://127.0.0.1:5176`. The workbench exposes: new data source, source library, distillation
+workspace, evidence review, Skill library, tasks/logs, and model/API settings.

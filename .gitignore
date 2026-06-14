@@ -1,8 +1,14 @@
 .env
 .venv/
+node_modules/
 __pycache__/
 *.py[cod]
+.codex-*.log
+.codex-*.out.log
+.codex-*.err.log
 .pytest_cache/
+.tmp_pytest*/
+.tmp_pytest_probe/
 .ruff_cache/
 .mypy_cache/
 data/

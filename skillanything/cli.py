@@ -104,6 +104,80 @@ def distill(
     console.print(f"Distiller: {skill.metadata.get('distiller')}")
 
 
+@app.command("build-corpus")
+def build_corpus(
+    profile_id: str = typer.Argument(..., help="Collected profile id."),
+    goal: str = typer.Option("", "--goal", help="Distillation goal."),
+    item_limit: int = typer.Option(1000, "--item-limit", "-n", min=1, max=5000),
+) -> None:
+    """Build and save a normalized Corpus IR record."""
+    sa = SkillAnythingApp()
+    corpus = sa.build_corpus(profile_id, goal=goal, item_limit=item_limit)
+    counts = corpus.get("metadata", {}).get("counts", {})
+    console.print(f"Corpus: [bold]{corpus['id']}[/bold]")
+    console.print(f"Documents: {counts.get('documents', 0)}")
+
+
+@app.command("extract-capability")
+def extract_capability(
+    profile_id: str = typer.Argument(..., help="Collected profile id."),
+    focus: str = typer.Argument(..., help="Capability focus to extract."),
+    capability_type: str = typer.Option(
+        "analysis_method",
+        "--type",
+        help="Custom capability type, e.g. research_pattern or prompt_recipe.",
+    ),
+    item_limit: int = typer.Option(80, "--item-limit", "-n", min=1, max=500),
+) -> None:
+    """Extract a typed Capability IR record from a profile."""
+    sa = SkillAnythingApp()
+    capability = sa.extract_capability(
+        profile_id,
+        focus=focus,
+        capability_type=capability_type,
+        item_limit=item_limit,
+    )
+    console.print(f"Capability: [bold]{capability['id']}[/bold]")
+    console.print(capability.get("summary") or "")
+
+
+@app.command("capabilities")
+def capabilities(
+    profile_id: Optional[str] = typer.Option(None, "--profile-id", help="Filter by profile."),
+    corpus_id: Optional[str] = typer.Option(None, "--corpus-id", help="Filter by corpus."),
+    limit: int = typer.Option(50, "--limit", "-n", min=1, max=200),
+) -> None:
+    """List distilled capabilities."""
+    sa = SkillAnythingApp()
+    sa.init()
+    table = Table("id", "profile", "type", "state", "confidence", "name")
+    for row in sa.repo.list_capabilities(profile_id=profile_id, corpus_id=corpus_id, limit=limit):
+        table.add_row(
+            row["id"],
+            row["profile_id"],
+            row.get("type") or "",
+            row.get("review_state") or "",
+            f"{float(row.get('confidence') or 0):.2f}",
+            row.get("name") or "",
+        )
+    console.print(table)
+
+
+@app.command("create-pack")
+def create_pack(
+    capability_id: str = typer.Argument(..., help="Capability id."),
+    target: list[str] = typer.Option(
+        None,
+        "--target",
+        help="Target surface, repeatable: codex-skill/openai-skill/claude-skill.",
+    ),
+) -> None:
+    """Create a SkillPack IR record from a capability."""
+    sa = SkillAnythingApp()
+    pack = sa.create_skill_pack(capability_id, target_surfaces=target or None)
+    console.print(f"Pack: [bold]{pack['id']}[/bold]")
+
+
 @app.command()
 def skills() -> None:
     """List distilled skills."""
@@ -192,11 +266,24 @@ def analyze_media(
 def export(
     skill_id: str = typer.Argument(..., help="Distilled skill id."),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output root directory."),
+    target: str = typer.Option("codex-skill", "--target", help="Export target."),
 ) -> None:
     """Export a Skill package."""
     sa = SkillAnythingApp()
-    path = sa.export(skill_id, output_root=output)
+    path = sa.export(skill_id, output_root=output, target=target)
     console.print(f"Exported [bold]{skill_id}[/bold] to [bold]{path}[/bold]")
+
+
+@app.command("export-pack")
+def export_pack(
+    pack_id: str = typer.Argument(..., help="SkillPack id."),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output root directory."),
+    target: str = typer.Option("codex-skill", "--target", help="Export target."),
+) -> None:
+    """Export a SkillPack to a target platform directory."""
+    sa = SkillAnythingApp()
+    artifact = sa.export_pack(pack_id, output_root=output, target=target)
+    console.print(f"Exported [bold]{pack_id}[/bold] to [bold]{artifact['path']}[/bold]")
 
 
 @app.command()

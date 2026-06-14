@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import json
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from skillanything.ir import CapabilityRequest
 from skillanything.pipeline import SkillAnythingApp
+from skillanything.utils import stable_id
 
 api = FastAPI(title="SkillAnything Local", version="0.1.0")
 _JOB_EXECUTOR = ThreadPoolExecutor(max_workers=2)
@@ -33,6 +37,7 @@ class DistillRequest(BaseModel):
 
 class ExportRequest(BaseModel):
     output_root: Optional[str] = None
+    target: str = "codex-skill"
 
 
 class ArchiveMediaRequest(BaseModel):
@@ -77,6 +82,65 @@ class ProviderSettingsRequest(BaseModel):
     xueqiu_cookie: Optional[str] = None
     cdp_url: Optional[str] = None
     media_max_assets: Optional[int] = Field(default=None, ge=0, le=5000)
+
+
+class CapabilityRequestPayload(BaseModel):
+    label: str
+    type: str = "analysis_method"
+    instructions: str = ""
+    schema: dict[str, Any] = Field(default_factory=dict)
+    origin: str = "user"
+
+    def to_ir(self) -> CapabilityRequest:
+        text = self.instructions.strip() or self.label.strip()
+        return CapabilityRequest(
+            id=stable_id("capability-request", self.type, self.label, text, self.origin),
+            label=self.label.strip() or self.type,
+            type=self.type,
+            instructions=text,
+            schema=self.schema,
+            origin=self.origin,
+        )
+
+
+class CorpusCreateRequest(BaseModel):
+    profile_id: str
+    goal: str = ""
+    item_limit: int = Field(default=1000, ge=1, le=5000)
+    capability_requests: list[CapabilityRequestPayload] = Field(default_factory=list)
+
+
+class CapabilityDiscoverRequest(BaseModel):
+    profile_id: Optional[str] = None
+    goal: str = ""
+    item_limit: int = Field(default=200, ge=1, le=1000)
+
+
+class CapabilityExtractRequest(BaseModel):
+    profile_id: str
+    focus: str
+    capability_type: str = "analysis_method"
+    item_limit: int = Field(default=80, ge=1, le=500)
+    schema: dict[str, Any] = Field(default_factory=dict)
+
+
+class CapabilityReviewRequest(BaseModel):
+    review_state: str = Field(default="approved")
+    notes: str = ""
+
+
+class PackCreateRequest(BaseModel):
+    target_surfaces: list[str] = Field(default_factory=lambda: ["codex-skill"])
+
+
+class PackExportRequest(BaseModel):
+    target: str = "codex-skill"
+    output_root: Optional[str] = None
+
+
+class V1JobRequest(BaseModel):
+    type: str
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 @api.on_event("startup")
@@ -239,6 +303,310 @@ def profile_full_run_job(request: ProfileFullRunRequest) -> dict:
     return _submit_job("profile_full_run", payload, runner)
 
 
+@api.post("/api/v1/jobs")
+def v1_create_job(request: V1JobRequest) -> dict:
+    job_type = request.type.strip()
+    payload = request.payload
+
+    def runner(
+        sa: SkillAnythingApp,
+        progress: Callable[[int, dict[str, Any] | None], None],
+    ) -> dict:
+        progress(5, {"stage": "queued"})
+        if job_type == "collect_source":
+            collect_request = CollectRequest(**payload)
+            result = sa.collect(
+                source=collect_request.source,
+                platform=collect_request.platform,
+                max_items=collect_request.max_items,
+                include_comments=collect_request.include_comments,
+                include_media=collect_request.include_media,
+                deep=collect_request.deep,
+                media_max_assets=collect_request.media_max_assets,
+            )
+            return {
+                "stage": "done",
+                "profile": result.profile.to_dict(),
+                "counts": _collect_counts(result),
+                "diagnostics": result.diagnostics,
+            }
+        if job_type == "profile_full_run":
+            run_request = ProfileFullRunRequest(**payload)
+            progress(15, {"stage": "collecting"})
+            return sa.full_run(
+                source=run_request.source,
+                platform=run_request.platform,
+                max_items=run_request.max_items,
+                include_comments=run_request.include_comments,
+                include_media=run_request.include_media,
+                deep=run_request.deep,
+                media_max_assets=run_request.media_max_assets,
+                item_limit=run_request.item_limit,
+            )
+        if job_type == "discover_capabilities":
+            discover_request = CapabilityDiscoverRequest(**payload)
+            if not discover_request.profile_id:
+                raise ValueError("profile_id is required")
+            progress(20, {"stage": "distilling"})
+            capability = sa.discover_capability(
+                discover_request.profile_id,
+                goal=discover_request.goal,
+                item_limit=discover_request.item_limit,
+            )
+            return {"stage": "done", "capability": capability}
+        if job_type == "extract_capability":
+            extract_request = CapabilityExtractRequest(**payload)
+            progress(20, {"stage": "extracting"})
+            capability = sa.extract_capability(
+                extract_request.profile_id,
+                focus=extract_request.focus,
+                capability_type=extract_request.capability_type,
+                item_limit=extract_request.item_limit,
+                schema=extract_request.schema,
+            )
+            return {"stage": "done", "capability": capability}
+        if job_type == "export_pack":
+            pack_id = str(payload.get("pack_id") or "")
+            if not pack_id:
+                raise ValueError("pack_id is required")
+            progress(30, {"stage": "exporting"})
+            artifact = sa.export_pack(
+                pack_id,
+                target=str(payload.get("target") or "codex-skill"),
+                output_root=Path(payload["output_root"]) if payload.get("output_root") else None,
+            )
+            return {"stage": "done", "artifact": artifact}
+        raise ValueError(f"unsupported job type: {job_type}")
+
+    return _submit_job(job_type, payload, runner)
+
+
+@api.get("/api/v1/jobs/{job_id}")
+def v1_job(job_id: str) -> dict:
+    return job(job_id)
+
+
+@api.get("/api/v1/jobs/{job_id}/events")
+def v1_job_events(job_id: str) -> StreamingResponse:
+    def stream():
+        last = ""
+        for _ in range(90):
+            sa = SkillAnythingApp()
+            sa.init()
+            row = sa.repo.get_job(job_id)
+            if not row:
+                yield "event: error\ndata: {\"error\":\"job not found\"}\n\n"
+                return
+            data = json.dumps(row, ensure_ascii=False)
+            if data != last:
+                yield f"event: job\ndata: {data}\n\n"
+                last = data
+            if row.get("status") in {"succeeded", "failed", "cancelled", "stale"}:
+                return
+            time.sleep(1)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@api.get("/api/v1/sources/connectors")
+def v1_source_connectors() -> list[dict[str, str]]:
+    return [
+        {"name": "file", "platform": "file", "input": "local path or file:// URL"},
+        {"name": "web", "platform": "web", "input": "http(s) page URL"},
+        {"name": "x", "platform": "x", "input": "X/Twitter profile or status URL"},
+        {"name": "xiaohongshu", "platform": "xiaohongshu", "input": "Xiaohongshu URL/text"},
+        {"name": "xueqiu", "platform": "xueqiu", "input": "Xueqiu profile/text"},
+        {"name": "rsshub", "platform": "rsshub", "input": "RSSHub route or URL"},
+    ]
+
+
+@api.post("/api/v1/sources:collect")
+@api.post("/api/v1/sources/collect")
+def v1_collect_source(request: CollectRequest) -> dict:
+    return collect(request)
+
+
+@api.post("/api/v1/corpora")
+def v1_create_corpus(request: CorpusCreateRequest) -> dict:
+    sa = SkillAnythingApp()
+    try:
+        return sa.build_corpus(
+            request.profile_id,
+            goal=request.goal,
+            item_limit=request.item_limit,
+            capability_requests=[item.to_ir() for item in request.capability_requests],
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@api.get("/api/v1/corpora")
+def v1_list_corpora(profile_id: Optional[str] = None, limit: int = 50) -> list[dict]:
+    sa = SkillAnythingApp()
+    sa.init()
+    return sa.repo.list_corpora(profile_id=profile_id, limit=limit)
+
+
+@api.get("/api/v1/corpora/{corpus_id}")
+def v1_get_corpus(corpus_id: str) -> dict:
+    sa = SkillAnythingApp()
+    sa.init()
+    row = sa.repo.get_corpus(corpus_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"corpus not found: {corpus_id}")
+    return row
+
+
+@api.post("/api/v1/corpora/{corpus_id}/capabilities:discover")
+@api.post("/api/v1/corpora/{corpus_id}/capabilities/discover")
+def v1_discover_from_corpus(corpus_id: str, request: CapabilityDiscoverRequest) -> dict:
+    sa = SkillAnythingApp()
+    sa.init()
+    corpus = sa.repo.get_corpus(corpus_id)
+    if not corpus:
+        raise HTTPException(status_code=404, detail=f"corpus not found: {corpus_id}")
+    try:
+        return sa.discover_capability(
+            request.profile_id or corpus["profile_id"],
+            goal=request.goal or corpus.get("goal") or "",
+            item_limit=request.item_limit,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@api.post("/api/v1/profiles/{profile_id}/capabilities:discover")
+@api.post("/api/v1/profiles/{profile_id}/capabilities/discover")
+def v1_discover_for_profile(profile_id: str, request: CapabilityDiscoverRequest) -> dict:
+    sa = SkillAnythingApp()
+    try:
+        return sa.discover_capability(
+            profile_id,
+            goal=request.goal,
+            item_limit=request.item_limit,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@api.post("/api/v1/capabilities:extract")
+@api.post("/api/v1/capabilities/extract")
+def v1_extract_capability(request: CapabilityExtractRequest) -> dict:
+    sa = SkillAnythingApp()
+    try:
+        return sa.extract_capability(
+            request.profile_id,
+            focus=request.focus,
+            capability_type=request.capability_type,
+            item_limit=request.item_limit,
+            schema=request.schema,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@api.get("/api/v1/capabilities")
+def v1_list_capabilities(
+    corpus_id: Optional[str] = None,
+    profile_id: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict]:
+    sa = SkillAnythingApp()
+    sa.init()
+    return sa.repo.list_capabilities(corpus_id=corpus_id, profile_id=profile_id, limit=limit)
+
+
+@api.get("/api/v1/capabilities/{capability_id}")
+def v1_get_capability(capability_id: str) -> dict:
+    sa = SkillAnythingApp()
+    sa.init()
+    row = sa.repo.get_capability(capability_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"capability not found: {capability_id}")
+    return row
+
+
+@api.post("/api/v1/capabilities/{capability_id}:review")
+@api.post("/api/v1/capabilities/{capability_id}/review")
+def v1_review_capability(capability_id: str, request: CapabilityReviewRequest) -> dict:
+    sa = SkillAnythingApp()
+    sa.init()
+    row = sa.repo.review_capability(
+        capability_id,
+        review_state=request.review_state,
+        metadata={"review_notes": request.notes},
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail=f"capability not found: {capability_id}")
+    return row
+
+
+@api.post("/api/v1/capabilities/{capability_id}/packs")
+def v1_create_pack(capability_id: str, request: PackCreateRequest) -> dict:
+    sa = SkillAnythingApp()
+    try:
+        return sa.create_skill_pack(capability_id, target_surfaces=request.target_surfaces)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@api.get("/api/v1/packs")
+def v1_list_packs(
+    profile_id: Optional[str] = None,
+    capability_id: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict]:
+    sa = SkillAnythingApp()
+    sa.init()
+    return sa.repo.list_skill_packs(profile_id=profile_id, capability_id=capability_id, limit=limit)
+
+
+@api.get("/api/v1/packs/{pack_id}")
+def v1_get_pack(pack_id: str) -> dict:
+    sa = SkillAnythingApp()
+    sa.init()
+    row = sa.repo.get_skill_pack(pack_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"skill pack not found: {pack_id}")
+    return row
+
+
+@api.post("/api/v1/packs/{pack_id}/exports")
+def v1_export_pack(pack_id: str, request: PackExportRequest) -> dict:
+    sa = SkillAnythingApp()
+    try:
+        return sa.export_pack(
+            pack_id,
+            target=request.target,
+            output_root=Path(request.output_root) if request.output_root else None,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@api.get("/api/v1/exports")
+def v1_list_exports(
+    pack_id: Optional[str] = None,
+    skill_id: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict]:
+    sa = SkillAnythingApp()
+    sa.init()
+    return sa.repo.list_export_artifacts(pack_id=pack_id, skill_id=skill_id, limit=limit)
+
+
+@api.get("/api/v1/exports/{artifact_id}")
+def v1_get_export(artifact_id: str) -> dict:
+    sa = SkillAnythingApp()
+    sa.init()
+    row = sa.repo.get_export_artifact(artifact_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"export not found: {artifact_id}")
+    return row
+
+
 @api.post("/collect")
 def collect(request: CollectRequest) -> dict:
     sa = SkillAnythingApp()
@@ -330,9 +698,15 @@ def skills() -> list[dict]:
 def export(skill_id: str, request: ExportRequest) -> dict:
     sa = SkillAnythingApp()
     try:
-        path = sa.export(skill_id, Path(request.output_root) if request.output_root else None)
+        path = sa.export(
+            skill_id,
+            Path(request.output_root) if request.output_root else None,
+            target=request.target,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"path": str(path)}
 
 
@@ -364,6 +738,8 @@ def _run_job(
             status="running",
             progress=max(0, min(99, value)),
             result=partial,
+            phase=str(partial.get("stage")) if partial and partial.get("stage") else None,
+            heartbeat=True,
         )
 
     try:
@@ -409,6 +785,15 @@ def _settings_response(sa: SkillAnythingApp) -> dict:
         "xueqiu": {"cookie_set": bool(sa.settings.xueqiu_cookie)},
         "browser": {"cdp_url": sa.settings.cdp_url},
         "media_max_assets": sa.settings.media_max_assets,
+    }
+
+
+def _collect_counts(result) -> dict[str, int]:
+    return {
+        "items": len(result.items),
+        "segments": len(result.segments),
+        "assets": len(result.assets),
+        "comments": len(result.comments),
     }
 
 

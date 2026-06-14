@@ -1,0 +1,23 @@
+:root {
+  color-scheme: light;
+  --sa-bg: #f7f6f2;
+  --sa-surface: #ffffff;
+  --sa-surface-soft: #fbfaf7;
+  --sa-surface-strong: #f0eee8;
+  --sa-text: #1f2933;
+  --sa-text-muted: #68727d;
+  --sa-border: #dedbd2;
+  --sa-border-strong: #c9c4b8;
+  --sa-accent: #d46b2c;
+  --sa-accent-strong: #a94416;
+  --sa-blue: #2563eb;
+  --sa-green: #0f8a5f;
+  --sa-red: #c0362c;
+  --sa-yellow: #d19a18;
+  --sa-shadow: 0 18px 50px rgba(48, 43, 35, 0.08);
+  --sa-radius: 8px;
+  --sa-radius-sm: 6px;
+  --sa-sidebar: 272px;
+  --sa-header: 68px;
+  --sa-font: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}

@@ -15,7 +15,7 @@ from skillanything.models import (
     ProfileBundle,
     Segment,
 )
-from skillanything.utils import from_json, to_json, utc_now
+from skillanything.utils import from_json, stable_id, to_json, utc_now
 
 
 class Repository:
@@ -141,7 +141,108 @@ class Repository:
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS collection_runs (
+                    id TEXT PRIMARY KEY,
+                    profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                    source TEXT NOT NULL,
+                    platform TEXT,
+                    request_json TEXT NOT NULL DEFAULT '{}',
+                    diagnostics_json TEXT NOT NULL DEFAULT '[]',
+                    counts_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS corpora (
+                    id TEXT PRIMARY KEY,
+                    profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    goal TEXT NOT NULL DEFAULT '',
+                    corpus_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_corpora_profile
+                    ON corpora(profile_id, updated_at);
+
+                CREATE TABLE IF NOT EXISTS capabilities (
+                    id TEXT PRIMARY KEY,
+                    corpus_id TEXT NOT NULL REFERENCES corpora(id) ON DELETE CASCADE,
+                    profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    origin TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0,
+                    review_state TEXT NOT NULL DEFAULT 'draft',
+                    capability_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_capabilities_corpus
+                    ON capabilities(corpus_id, updated_at);
+
+                CREATE TABLE IF NOT EXISTS evidence_links (
+                    id TEXT PRIMARY KEY,
+                    capability_id TEXT NOT NULL REFERENCES capabilities(id) ON DELETE CASCADE,
+                    doc_id TEXT,
+                    segment_id TEXT,
+                    quote TEXT NOT NULL DEFAULT '',
+                    support_type TEXT NOT NULL DEFAULT 'supports',
+                    tier TEXT NOT NULL DEFAULT 'source',
+                    confidence REAL NOT NULL DEFAULT 0,
+                    link_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_packs (
+                    id TEXT PRIMARY KEY,
+                    capability_id TEXT NOT NULL REFERENCES capabilities(id) ON DELETE CASCADE,
+                    skill_id TEXT,
+                    profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    pack_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_skill_packs_profile
+                    ON skill_packs(profile_id, updated_at);
+
+                CREATE TABLE IF NOT EXISTS export_artifacts (
+                    id TEXT PRIMARY KEY,
+                    pack_id TEXT REFERENCES skill_packs(id) ON DELETE SET NULL,
+                    skill_id TEXT,
+                    target TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    artifact_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
+            )
+            for column, definition in {
+                "phase": "TEXT",
+                "heartbeat_at": "TEXT",
+                "attempts": "INTEGER NOT NULL DEFAULT 0",
+                "parent_id": "TEXT",
+                "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
+                "idempotency_key": "TEXT",
+            }.items():
+                self._ensure_column(conn, "jobs", column, definition)
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations(version, name, applied_at)
+                VALUES ('2026-06-14-ir-v1', 'SkillAnything IR v1 additive schema', ?)
+                """,
+                (utc_now(),),
             )
             try:
                 conn.execute(
@@ -161,6 +262,17 @@ class Repository:
             except sqlite3.OperationalError:
                 # Some Python builds omit FTS5. LIKE fallback still keeps Q&A usable.
                 pass
+
+    @staticmethod
+    def _ensure_column(
+        conn: sqlite3.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> None:
+        columns = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def upsert_profile(self, profile: Profile) -> Profile:
         now = utc_now()
@@ -571,6 +683,9 @@ class Repository:
         error: str | None = None,
         started: bool = False,
         finished: bool = False,
+        phase: str | None = None,
+        heartbeat: bool = False,
+        cancel_requested: bool | None = None,
     ) -> None:
         current = self.get_job(job_id)
         if not current:
@@ -585,13 +700,23 @@ class Repository:
             "updated_at": now,
             "started_at": now if started else current.get("started_at"),
             "finished_at": now if finished else current.get("finished_at"),
+            "phase": phase if phase is not None else current.get("phase"),
+            "heartbeat_at": now if heartbeat else current.get("heartbeat_at"),
+            "cancel_requested": (
+                1
+                if cancel_requested is True
+                else 0
+                if cancel_requested is False
+                else int(current.get("cancel_requested") or 0)
+            ),
         }
         with self.connect() as conn:
             conn.execute(
                 """
                 UPDATE jobs
                 SET status = ?, progress = ?, total = ?, result_json = ?, error = ?,
-                    updated_at = ?, started_at = ?, finished_at = ?
+                    updated_at = ?, started_at = ?, finished_at = ?,
+                    phase = ?, heartbeat_at = ?, cancel_requested = ?
                 WHERE id = ?
                 """,
                 (
@@ -603,6 +728,9 @@ class Repository:
                     values["updated_at"],
                     values["started_at"],
                     values["finished_at"],
+                    values["phase"],
+                    values["heartbeat_at"],
+                    values["cancel_requested"],
                     job_id,
                 ),
             )
@@ -619,6 +747,391 @@ class Repository:
                 (limit,),
             ).fetchall()
         return [self._job_from_row(row) for row in rows]
+
+    def save_collection_run(
+        self,
+        *,
+        profile_id: str,
+        source: str,
+        platform: str | None,
+        request: dict[str, Any],
+        diagnostics: list[str],
+        counts: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = utc_now()
+        row = {
+            "id": stable_id("collection-run", profile_id, source, platform, now),
+            "profile_id": profile_id,
+            "source": source,
+            "platform": platform,
+            "request": request,
+            "diagnostics": diagnostics,
+            "counts": counts,
+            "created_at": now,
+        }
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO collection_runs (
+                    id, profile_id, source, platform, request_json,
+                    diagnostics_json, counts_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    profile_id,
+                    source,
+                    platform,
+                    to_json(request),
+                    to_json(diagnostics),
+                    to_json(counts),
+                    now,
+                ),
+            )
+        return row
+
+    def save_corpus(self, corpus: Any) -> dict[str, Any]:
+        data = _to_mapping(corpus)
+        now = utc_now()
+        data.setdefault("created_at", now)
+        data["updated_at"] = now
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO corpora (
+                    id, profile_id, title, goal, corpus_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    title=excluded.title,
+                    goal=excluded.goal,
+                    corpus_json=excluded.corpus_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    data["id"],
+                    data["profile_id"],
+                    data.get("title") or data["id"],
+                    data.get("goal") or "",
+                    to_json(data),
+                    data["created_at"],
+                    data["updated_at"],
+                ),
+            )
+        return data
+
+    def get_corpus(self, corpus_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM corpora WHERE id = ?", (corpus_id,)).fetchone()
+        return self._corpus_from_row(row) if row else None
+
+    def list_corpora(
+        self,
+        *,
+        profile_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if profile_id:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM corpora
+                    WHERE profile_id = ?
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (profile_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM corpora ORDER BY updated_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [self._corpus_from_row(row) for row in rows]
+
+    def save_capability(self, capability: Any) -> dict[str, Any]:
+        data = _to_mapping(capability)
+        now = utc_now()
+        data.setdefault("created_at", now)
+        data["updated_at"] = now
+        evidence = list(data.get("evidence") or [])
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO capabilities (
+                    id, corpus_id, profile_id, name, type, origin, confidence,
+                    review_state, capability_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name=excluded.name,
+                    type=excluded.type,
+                    origin=excluded.origin,
+                    confidence=excluded.confidence,
+                    review_state=excluded.review_state,
+                    capability_json=excluded.capability_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    data["id"],
+                    data["corpus_id"],
+                    data["profile_id"],
+                    data.get("name") or data["id"],
+                    data.get("type") or "analysis_method",
+                    data.get("origin") or "auto",
+                    float(data.get("confidence") or 0),
+                    data.get("review_state") or "draft",
+                    to_json(data),
+                    data["created_at"],
+                    data["updated_at"],
+                ),
+            )
+            conn.execute("DELETE FROM evidence_links WHERE capability_id = ?", (data["id"],))
+            for index, link in enumerate(evidence):
+                link_data = _to_mapping(link)
+                link_id = link_data.get("id") or stable_id("evidence", data["id"], index)
+                conn.execute(
+                    """
+                    INSERT INTO evidence_links (
+                        id, capability_id, doc_id, segment_id, quote, support_type,
+                        tier, confidence, link_json, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        link_id,
+                        data["id"],
+                        link_data.get("doc_id") or link_data.get("item_id"),
+                        link_data.get("segment_id"),
+                        link_data.get("quote") or "",
+                        link_data.get("support_type") or "supports",
+                        link_data.get("tier") or "source",
+                        float(link_data.get("confidence") or 0),
+                        to_json(link_data),
+                        now,
+                    ),
+                )
+        return data
+
+    def get_capability(self, capability_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM capabilities WHERE id = ?",
+                (capability_id,),
+            ).fetchone()
+        return self._capability_from_row(row) if row else None
+
+    def list_capabilities(
+        self,
+        *,
+        corpus_id: str | None = None,
+        profile_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if corpus_id:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM capabilities
+                    WHERE corpus_id = ?
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (corpus_id, limit),
+                ).fetchall()
+            elif profile_id:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM capabilities
+                    WHERE profile_id = ?
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (profile_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM capabilities ORDER BY updated_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [self._capability_from_row(row) for row in rows]
+
+    def review_capability(
+        self,
+        capability_id: str,
+        *,
+        review_state: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        data = self.get_capability(capability_id)
+        if not data:
+            return None
+        data["review_state"] = review_state
+        if metadata:
+            data.setdefault("metadata", {}).update(metadata)
+        return self.save_capability(data)
+
+    def save_skill_pack(self, pack: Any) -> dict[str, Any]:
+        data = _to_mapping(pack)
+        now = utc_now()
+        data.setdefault("created_at", now)
+        data["updated_at"] = now
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO skill_packs (
+                    id, capability_id, skill_id, profile_id, title, version,
+                    pack_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    title=excluded.title,
+                    version=excluded.version,
+                    pack_json=excluded.pack_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    data["id"],
+                    data["capability_id"],
+                    data.get("skill_id"),
+                    data["profile_id"],
+                    data.get("title") or data["id"],
+                    data.get("version") or "0.1.0",
+                    to_json(data),
+                    data["created_at"],
+                    data["updated_at"],
+                ),
+            )
+        return data
+
+    def get_skill_pack(self, pack_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM skill_packs WHERE id = ?", (pack_id,)).fetchone()
+        return self._skill_pack_from_row(row) if row else None
+
+    def find_skill_pack_by_skill(self, skill_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM skill_packs
+                WHERE skill_id = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (skill_id,),
+            ).fetchone()
+        return self._skill_pack_from_row(row) if row else None
+
+    def list_skill_packs(
+        self,
+        *,
+        profile_id: str | None = None,
+        capability_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if capability_id:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM skill_packs
+                    WHERE capability_id = ?
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (capability_id, limit),
+                ).fetchall()
+            elif profile_id:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM skill_packs
+                    WHERE profile_id = ?
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (profile_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM skill_packs ORDER BY updated_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [self._skill_pack_from_row(row) for row in rows]
+
+    def save_export_artifact(
+        self,
+        *,
+        pack_id: str | None,
+        skill_id: str | None,
+        target: str,
+        path: str,
+        artifact: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = utc_now()
+        artifact_id = stable_id("export-artifact", pack_id, skill_id, target, path, now)
+        row = {
+            "id": artifact_id,
+            "pack_id": pack_id,
+            "skill_id": skill_id,
+            "target": target,
+            "path": path,
+            "artifact": artifact,
+            "created_at": now,
+        }
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO export_artifacts (
+                    id, pack_id, skill_id, target, path, artifact_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (artifact_id, pack_id, skill_id, target, path, to_json(artifact), now),
+            )
+        return row
+
+    def get_export_artifact(self, artifact_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM export_artifacts WHERE id = ?",
+                (artifact_id,),
+            ).fetchone()
+        return self._export_artifact_from_row(row) if row else None
+
+    def list_export_artifacts(
+        self,
+        *,
+        pack_id: str | None = None,
+        skill_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if pack_id:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM export_artifacts
+                    WHERE pack_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (pack_id, limit),
+                ).fetchall()
+            elif skill_id:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM export_artifacts
+                    WHERE skill_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (skill_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM export_artifacts ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [self._export_artifact_from_row(row) for row in rows]
 
     def get_app_settings(self) -> dict[str, str]:
         with self.connect() as conn:
@@ -899,6 +1412,57 @@ class Repository:
         return [dict(row) for row in rows]
 
     @staticmethod
+    def _corpus_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        data = from_json(row["corpus_json"], {})
+        data.setdefault("id", row["id"])
+        data.setdefault("profile_id", row["profile_id"])
+        data.setdefault("title", row["title"])
+        data.setdefault("goal", row["goal"])
+        data.setdefault("created_at", row["created_at"])
+        data.setdefault("updated_at", row["updated_at"])
+        return data
+
+    @staticmethod
+    def _capability_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        data = from_json(row["capability_json"], {})
+        data.setdefault("id", row["id"])
+        data.setdefault("corpus_id", row["corpus_id"])
+        data.setdefault("profile_id", row["profile_id"])
+        data.setdefault("name", row["name"])
+        data.setdefault("type", row["type"])
+        data.setdefault("origin", row["origin"])
+        data.setdefault("confidence", row["confidence"])
+        data.setdefault("review_state", row["review_state"])
+        data.setdefault("created_at", row["created_at"])
+        data.setdefault("updated_at", row["updated_at"])
+        return data
+
+    @staticmethod
+    def _skill_pack_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        data = from_json(row["pack_json"], {})
+        data.setdefault("id", row["id"])
+        data.setdefault("capability_id", row["capability_id"])
+        data.setdefault("skill_id", row["skill_id"])
+        data.setdefault("profile_id", row["profile_id"])
+        data.setdefault("title", row["title"])
+        data.setdefault("version", row["version"])
+        data.setdefault("created_at", row["created_at"])
+        data.setdefault("updated_at", row["updated_at"])
+        return data
+
+    @staticmethod
+    def _export_artifact_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "pack_id": row["pack_id"],
+            "skill_id": row["skill_id"],
+            "target": row["target"],
+            "path": row["path"],
+            "artifact": from_json(row["artifact_json"], {}),
+            "created_at": row["created_at"],
+        }
+
+    @staticmethod
     def _profile_from_row(row: sqlite3.Row) -> Profile:
         return Profile(
             id=row["id"],
@@ -969,6 +1533,7 @@ class Repository:
 
     @staticmethod
     def _job_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        keys = set(row.keys())
         return {
             "id": row["id"],
             "type": row["type"],
@@ -982,6 +1547,12 @@ class Repository:
             "updated_at": row["updated_at"],
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],
+            "phase": row["phase"] if "phase" in keys else None,
+            "heartbeat_at": row["heartbeat_at"] if "heartbeat_at" in keys else None,
+            "attempts": row["attempts"] if "attempts" in keys else 0,
+            "parent_id": row["parent_id"] if "parent_id" in keys else None,
+            "cancel_requested": bool(row["cancel_requested"]) if "cancel_requested" in keys else False,
+            "idempotency_key": row["idempotency_key"] if "idempotency_key" in keys else None,
         }
 
 
@@ -1007,3 +1578,11 @@ def re_tokens(query: str) -> list[str]:
                     if piece not in tokens:
                         tokens.append(piece)
     return tokens
+
+
+def _to_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if hasattr(value, "to_dict"):
+        return dict(value.to_dict())
+    raise TypeError(f"expected dict-like value, got {type(value).__name__}")
