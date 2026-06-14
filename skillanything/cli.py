@@ -95,10 +95,11 @@ def items(profile_id: str, limit: int = typer.Option(50, "--limit", "-n")) -> No
 def distill(
     profile_id: str = typer.Argument(..., help="Collected profile id."),
     item_limit: int = typer.Option(200, "--item-limit", "-n", min=1, max=1000),
+    goal: str = typer.Option("", "--goal", help="Optional distillation goal for the planner."),
 ) -> None:
     """Distill a collected profile into a Skill model."""
     sa = SkillAnythingApp()
-    skill = sa.distill(profile_id, item_limit=item_limit)
+    skill = sa.distill(profile_id, item_limit=item_limit, goal=goal)
     console.print(f"Skill: [bold]{skill.id}[/bold]")
     console.print(skill.summary)
     console.print(f"Distiller: {skill.metadata.get('distiller')}")

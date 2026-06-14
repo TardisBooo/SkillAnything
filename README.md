@@ -1,21 +1,141 @@
 # SkillAnything Local
 
-Local-first pipeline for turning public community homepages into agent-ready Skill packages.
+SkillAnything 是一个本地优先的 Skill 蒸馏工厂：从公开内容、主页、帖子、媒体转写、评论和本地文件中提取可复用能力，并打包成不同 AI 平台可使用的 Skill。
 
-Current capabilities:
+它的目标不是复刻某个创作者本人，而是从证据中抽取可迁移的方法、流程、判断规则、表达习惯、边界条件和评测用例。
 
-- Collect Xiaohongshu profiles with text, images, video, subtitles, and optional ASR/Vision.
-- Collect Xueqiu users as text-only profiles.
-- Normalize profiles, posts, media, text segments, comments, and skills into SQLite.
-- Distill a profile into `SKILL.md`, `posts/`, `分析/`, references, evals, and `skill.yaml`.
-- Ask questions against the local knowledge base.
-- Extract focused skills such as `美股风险分析` from an existing profile.
-- Use from CLI or the built-in FastAPI web console.
+## 设计目标
 
-This project does not bypass CAPTCHA, paid walls, login restrictions, or platform anti-abuse systems.
-Use it only with content you are authorized to access.
+- 本地优先：SQLite、本地归档、本地导出，默认不依赖云端服务。
+- 证据约束：所有强规则都应能追溯到来源内容，低置信度结论要显式标记。
+- 通用蒸馏：不把所有内容强行套进宏观分析、投研分析或营销模板。
+- 可扩展数据源：不同来源向上输出统一结构，方便新增 connector。
+- Planner-driven：先由 Planner Agent 阅读内容并设计蒸馏任务，再执行 Skill 生成。
+- 多平台封装：同一份 IR 可以导出为 Codex Skill、OpenAI Skill、Claude Skill、Claude Project Bundle 或 JSON IR。
 
-## Install
+## 总体架构
+
+```text
+Data Source
+  URL / local file / profile / RSS / media / comments
+        |
+        v
+Source Layer
+  Connector -> SourceDocument -> Corpus
+        |
+        v
+Distillation Layer
+  DistillationPlanner -> DistillationPlan
+  Distiller -> DistilledSkill
+  CapabilityDistillationPipeline -> Capability + EvidenceLink
+        |
+        v
+Packaging Layer
+  SkillPack -> target exporters
+        |
+        v
+Codex Skill / OpenAI Skill / Claude Skill / Claude Project Bundle / JSON IR
+```
+
+核心模块：
+
+- `skillanything/connectors/`: 平台和文件采集器。
+- `skillanything/sources/`: 数据源层适配协议，把采集结果统一成 SourceDocument。
+- `skillanything/ir.py`: SourceDocument、Corpus、Capability、SkillPack 等中间表示。
+- `skillanything/distill/planner.py`: Planner Agent，负责设计蒸馏任务。
+- `skillanything/distill/distiller.py`: 通用蒸馏执行器，支持 LLM 和本地 fallback。
+- `skillanything/distill/pipeline.py`: 串联 Corpus、Plan、Skill、Capability、Pack。
+- `skillanything/package/exporters/`: 多平台导出器。
+- `skillanything/storage/repository.py`: SQLite 持久化、任务、索引、导出记录。
+- `skillanything/web.py`: FastAPI API 和旧版内置控制台。
+- `frontend/`: Vue 3 工作台。
+
+## 三层机制
+
+### 1. 数据源层
+
+数据源层负责把不同来源统一为上层可消费的数据结构。
+
+输入可以是：
+
+- 本地文件
+- Web 页面
+- 小红书主页
+- 雪球用户
+- X / Twitter 内容
+- RSSHub
+- 未来新增的自定义数据源
+
+统一向上输出：
+
+- `SourceDocument`: 单篇内容、标题、正文、来源 URL、指标、媒体、片段、评论。
+- `Corpus`: 面向一次蒸馏任务的语料集合，包含 profile、documents、目标、能力请求和统计信息。
+
+扩展新数据源时，可以实现 `skillanything/sources/base.py` 中的 `SourceAdapter`，或复用现有 connector 并把结果转成 `SourceDocument`。
+
+### 2. 蒸馏层
+
+蒸馏层是核心。
+
+过去版本的本地 fallback 偏向宏观分析，会默认使用“指标、传导链、风险情景”等模板。现在已经改成 Planner-driven：
+
+```text
+Corpus + goal + capability_type + schema
+        |
+        v
+DistillationPlanner
+        |
+        v
+DistillationPlan
+        |
+        v
+Distiller
+        |
+        v
+DistilledSkill
+```
+
+`DistillationPlan` 包含：
+
+- `domain`: 识别出的任务领域。
+- `capability_type`: 要抽取的能力类型。
+- `extraction_targets`: 需要抽取哪些能力要素。
+- `evidence_questions`: 应该向语料追问哪些证据问题。
+- `workflow_axes`: 生成 Skill 时的工作流轴线。
+- `style_axes`: 输出风格约束。
+- `guardrails`: 防冒充、防过拟合、防无证据推断的规则。
+- `eval_scenarios`: 评测场景。
+- `output_schema`: 用户自定义或默认输出结构。
+- `tasks`: 具体蒸馏任务拆解。
+
+当前内置的通用规划类型：
+
+- `trading_strategy`: 股票交易实盘策略，抽取 setup、entry、exit、position sizing、risk、review。
+- `marketing_growth`: 小红书/内容营销/广告增长，抽取 audience、hook、creative、channel、conversion、metrics。
+- `industry_research`: 产业链/公司相关性研究，抽取 chain、entities、mechanism、evidence、confidence、watchlist。
+- `generic`: 未知领域的通用能力蒸馏，抽取 inputs、rules、workflow、outputs、evidence、limits。
+
+有 LLM 配置时，Distiller 会把 `DistillationPlan` 和证据语料一起发给模型。
+
+没有 LLM 配置时，本地 fallback 也会按 plan 生成可运行 Skill 骨架，不再写死宏观分析模板。
+
+### 3. Skill 封装层
+
+蒸馏结果会被转换为：
+
+- `Capability`: 可审阅、可复用的能力记录。
+- `EvidenceLink`: 能力与来源证据之间的链接。
+- `SkillPack`: 面向导出的完整包。
+
+支持导出目标：
+
+- `codex-skill`
+- `openai-skill`
+- `claude-skill`
+- `claude-project-bundle`
+- `json-ir`
+
+## 安装
 
 ```powershell
 python -m venv .venv
@@ -23,100 +143,224 @@ python -m venv .venv
 pip install -e ".[dev,browser,media,vector]"
 ```
 
-Copy `.env.example` to `.env` and configure your own keys.
+复制配置模板：
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-## Quick Start
+可选模型配置：
 
-Start the web console:
+```dotenv
+SKILLANYTHING_LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+SKILLANYTHING_LLM_API_KEY=your-key
+SKILLANYTHING_LLM_MODEL=qwen-plus
 
-```powershell
-sa ui --host 127.0.0.1 --port 9000
+SKILLANYTHING_VISION_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+SKILLANYTHING_VISION_API_KEY=your-key
+SKILLANYTHING_VISION_MODEL=qwen3-vl-plus
+
+SKILLANYTHING_ASR_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+SKILLANYTHING_ASR_API_KEY=your-key
+SKILLANYTHING_ASR_MODEL=qwen3-asr-flash
 ```
 
-Open `http://127.0.0.1:9000/`.
+没有模型 key 时，采集、索引、问答和蒸馏仍可使用本地 fallback 跑通。
 
-Use the UI to:
+## CLI 使用
 
-1. Paste a homepage link, for example `https://xueqiu.com/u/2445021949`.
-2. Open `模型/API 设置` and configure your Qwen/DashScope-compatible text model.
-3. Choose platform or leave auto-detect.
-4. Click `开始蒸馏`.
-5. Ask questions against the generated knowledge base.
-6. Extract a focused Skill and export it.
-
-CLI equivalent:
+初始化：
 
 ```powershell
 sa init
-sa collect "https://xueqiu.com/u/2445021949" --platform xueqiu --max-items 20 --no-media
-sa profiles
-sa distill <profile-id>
-sa ask <profile-id> "他如何分析美股风险？"
-sa extract-skill <profile-id> "美股风险分析"
-sa export <skill-id>
 ```
 
-## Web Console
+采集本地文件：
 
-The built-in console is designed to work without a separate frontend build step.
+```powershell
+sa collect "D:\data\creator-notes.md" --platform local --max-items 20
+```
 
-Main sections:
+采集雪球：
 
-- `当前使用模型`: shows the active text, image, and ASR models and their provider base URLs.
-- `一键蒸馏`: paste a homepage URL, choose platform, set item count, and start a background job.
-- `知识库`: select a collected profile and inspect recently collected posts.
-- `模型/API 设置`: configure providers from the browser without editing `.env`.
-- `问答`: ask questions such as "某个帖子说了什么？" or "他如何分析美股风险？".
-- `提取特定 Skill`: generate a focused Skill from the profile knowledge base.
+```powershell
+sa collect "https://xueqiu.com/u/2445021949" --platform xueqiu --max-items 20 --no-media
+```
 
-Provider settings saved in the UI are stored in local SQLite under `SKILLANYTHING_HOME`. API keys
-and cookies are never echoed back to the page; the UI only shows whether a secret is configured.
-The header contains a direct `设置模型/API` entry so new users can configure providers before
-running their first distillation.
+采集小红书：
 
-Recommended Qwen/DashScope-compatible values:
+```powershell
+sa collect "https://www.xiaohongshu.com/user/profile/<id>" --platform xiaohongshu --max-items 100
+```
+
+查看 profile：
+
+```powershell
+sa profiles
+sa items <profile_id>
+```
+
+自主蒸馏：
+
+```powershell
+sa distill <profile_id> --goal "蒸馏这个创作者可复用的方法论"
+```
+
+定向蒸馏股票交易实盘策略：
+
+```powershell
+sa extract-capability <profile_id> "蒸馏股票交易实盘选手的策略 Skill" --type trading_strategy
+```
+
+定向蒸馏小红书广告营销 Skill：
+
+```powershell
+sa extract-capability <profile_id> "提取小红书自媒体广告营销 Skill" --type marketing_growth
+```
+
+定向蒸馏产业链相关性挖掘 Skill：
+
+```powershell
+sa extract-capability <profile_id> "中国 A 股产业链相关性挖掘" --type chain_relevance_mining
+```
+
+查看能力和打包：
+
+```powershell
+sa capabilities --profile-id <profile_id>
+sa create-pack <capability_id> --target codex-skill --target claude-skill
+sa export-pack <pack_id> --target claude-project-bundle
+```
+
+导出旧 Skill：
+
+```powershell
+sa skills
+sa export <skill_id> --target codex-skill
+```
+
+本地知识库问答：
+
+```powershell
+sa ask <profile_id> "这个创作者如何做交易复盘？"
+```
+
+## API 使用
+
+启动后端：
+
+```powershell
+sa ui --host 127.0.0.1 --port 8091
+```
+
+常用旧 API：
+
+- `GET /health`
+- `GET /profiles`
+- `GET /profiles/{profile_id}/items`
+- `POST /profiles/{profile_id}/distill`
+- `POST /profiles/{profile_id}/ask`
+- `POST /profiles/{profile_id}/skills/extract`
+- `POST /skills/{skill_id}/export`
+- `POST /jobs/profile-full-run`
+
+新增 v1 API：
+
+- `GET /api/v1/sources/connectors`
+- `POST /api/v1/sources:collect`
+- `POST /api/v1/corpora`
+- `GET /api/v1/corpora`
+- `POST /api/v1/profiles/{profile_id}/capabilities:discover`
+- `POST /api/v1/capabilities:extract`
+- `GET /api/v1/capabilities`
+- `POST /api/v1/capabilities/{capability_id}:review`
+- `POST /api/v1/capabilities/{capability_id}/packs`
+- `GET /api/v1/packs`
+- `POST /api/v1/packs/{pack_id}/exports`
+- `GET /api/v1/exports`
+- `POST /api/v1/jobs`
+- `GET /api/v1/jobs/{job_id}/events`
+
+示例：定向提取 Capability。
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8091/api/v1/capabilities:extract `
+  -ContentType application/json `
+  -Body '{
+    "profile_id": "<profile_id>",
+    "focus": "提取小红书自媒体广告营销 Skill",
+    "capability_type": "marketing_growth",
+    "schema": {
+      "outputs": ["audience", "hook", "creative", "channel", "conversion", "metrics", "evidence"]
+    }
+  }'
+```
+
+示例：导出 JSON IR。
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8091/api/v1/packs/<pack_id>/exports `
+  -ContentType application/json `
+  -Body '{"target":"json-ir"}'
+```
+
+## 前端工作台
+
+后端：
+
+```powershell
+sa ui --host 127.0.0.1 --port 8091
+```
+
+前端：
+
+```powershell
+cd frontend
+npm install
+$env:VITE_SKILLANYTHING_API_PROXY="http://127.0.0.1:8091"
+npm run dev
+```
+
+打开：
 
 ```text
-Text Base URL:   https://dashscope.aliyuncs.com/compatible-mode/v1
-Text Model:      qwen-plus or qwen3-vl-plus
-Vision Model:    qwen3-vl-plus
-ASR Model:       qwen3-asr-flash
-ASR Language:    zh
+http://127.0.0.1:5176
 ```
 
-## Platform Notes
+工作台包含：
 
-### Xueqiu
+- 新建数据源
+- 来源库
+- 蒸馏工作台
+- 证据审阅
+- Skill 库
+- 任务与日志
+- 模型/API 设置
 
-Xueqiu collection is text-only. The connector reads:
+## 数据源说明
 
-- post text and long-form detail pages
-- title or generated text title
-- publish time
-- source URL
-- repost/comment/like metrics
-- reposted status text when present
+### 雪球
 
-Without `SKILLANYTHING_XUEQIU_COOKIE`, Xueqiu usually exposes only the first public timeline page.
-To fetch more pages, copy your own logged-in browser Cookie into `.env`:
+雪球 connector 当前以文本采集为主，支持：
+
+- 用户主页
+- 帖子正文
+- 长文详情页
+- 发布时间
+- 来源 URL
+- 转发、评论、点赞等指标
+
+如需更多页面，配置自己的登录 Cookie：
 
 ```dotenv
 SKILLANYTHING_XUEQIU_COOKIE=xq_a_token=...; xq_id_token=...; u=...
 ```
 
-Test URL:
+### 小红书
 
-```powershell
-sa collect "https://xueqiu.com/u/2445021949" --platform xueqiu --max-items 20 --no-media
-```
-
-### Xiaohongshu
-
-For deep Xiaohongshu collection, expose a logged-in Chrome session:
+深度采集小红书时，可以打开一个带远程调试端口的 Chrome：
 
 ```powershell
 & "C:\Program Files\Google\Chrome\Application\chrome.exe" `
@@ -124,175 +368,48 @@ For deep Xiaohongshu collection, expose a logged-in Chrome session:
   --user-data-dir="$env:TEMP\skillanything-chrome"
 ```
 
-Then log in to Xiaohongshu in that browser and run:
+然后在该浏览器中登录小红书，再执行采集。
+
+## 扩展 Planner
+
+新增一种能力类型时，优先扩展 `skillanything/distill/planner.py`：
+
+1. 增加 domain spec。
+2. 定义 `keywords`，用于本地识别领域。
+3. 定义 `targets`，说明要抽取哪些能力要素。
+4. 定义 `evidence_questions`，说明要向语料追问哪些证据。
+5. 定义 `workflow_axes` 和 `style_axes`。
+6. 定义 `guardrails`，防止无证据泛化。
+7. 定义 `eval_scenarios`，用于生成测试用例。
+8. 定义默认 `schema`。
+
+如果用户传入自定义 schema，Planner 会把用户 schema 与默认 schema 合并。
+
+## 测试
 
 ```powershell
-sa collect "https://www.xiaohongshu.com/user/profile/<id>" --platform xiaohongshu --max-items 100
-```
-
-Vision and ASR are optional. If omitted, text distillation still works.
-
-## API
-
-The local API defaults to no authentication and should be bound to `127.0.0.1`.
-Do not expose it directly to the public internet.
-
-Useful endpoints:
-
-- `GET /config/status`: configured provider status without leaking keys.
-- `GET /settings`: saved provider settings with only boolean secret status.
-- `POST /settings`: save provider settings locally.
-- `POST /jobs/profile-full-run`: collect, distill, and export in a background job.
-- `GET /jobs/{job_id}`: poll job status.
-- `GET /profiles`: list collected profiles.
-- `GET /profiles/{profile_id}/items`: list posts.
-- `POST /profiles/{profile_id}/ask`: ask the knowledge base.
-- `POST /profiles/{profile_id}/skills/extract`: extract a focused Skill.
-- `POST /skills/{skill_id}/export`: export a Skill package.
-
-Example:
-
-```powershell
-$job = Invoke-RestMethod -Method Post `
-  -Uri http://127.0.0.1:9000/jobs/profile-full-run `
-  -ContentType application/json `
-  -Body '{"source":"https://xueqiu.com/u/2445021949","platform":"xueqiu","max_items":20,"include_media":false}'
-
-Invoke-RestMethod http://127.0.0.1:9000/jobs/$($job.id)
-```
-
-## Configuration
-
-Core variables:
-
-- `SKILLANYTHING_HOME`: SQLite database, archive, and output root. Defaults to `./data`.
-- `SKILLANYTHING_LLM_BASE_URL`, `SKILLANYTHING_LLM_API_KEY`, `SKILLANYTHING_LLM_MODEL`: OpenAI-compatible LLM for distillation and Q&A.
-- `SKILLANYTHING_VISION_BASE_URL`, `SKILLANYTHING_VISION_API_KEY`, `SKILLANYTHING_VISION_MODEL`: OpenAI-compatible vision model.
-- `SKILLANYTHING_ASR_BASE_URL`, `SKILLANYTHING_ASR_API_KEY`, `SKILLANYTHING_ASR_MODEL`: ASR provider.
-- `SKILLANYTHING_XUEQIU_COOKIE`: optional logged-in Xueqiu Cookie.
-- `SKILLANYTHING_CDP_URL`: Chrome DevTools endpoint for browser-assisted collection.
-
-If no LLM key is configured, distillation and Q&A use deterministic local fallbacks so the pipeline
-remains testable.
-
-The same provider values can be configured in the web console. They are saved locally in SQLite and
-are not echoed back to the page after saving.
-
-## Testing
-
-```powershell
-pytest -q
 python -m compileall skillanything
-python -m ruff check .
-```
-
-End-to-end smoke checks:
-
-```powershell
-# Xueqiu text-only collection
-sa collect "https://xueqiu.com/u/2445021949" --platform xueqiu --max-items 20 --no-media
-
-# Start the web console and run the same URL from the browser
-sa ui --host 127.0.0.1 --port 9000
-```
-
-Expected Xueqiu behavior without Cookie:
-
-- first public timeline page can be collected
-- additional pages may return `login_required_for_more_pages`
-- no media assets are created for Xueqiu
-
-For a local Williams regression test, point `SKILLANYTHING_HOME` at an existing local database:
-
-```powershell
-$env:SKILLANYTHING_HOME="D:\Data\HC_PROJECT\v2\SkillAnything\data\full-run-williams-final-20260527"
-sa ask d4f261b35690b713d0d721147a5ba599 "请告诉我应该如何分析美股的风险"
-sa extract-skill d4f261b35690b713d0d721147a5ba599 "美股风险分析"
-```
-
-Do not commit local `data/`, `.env`, generated archives, or exported private profiles.
-
-## Local Data
-
-By default, runtime state is written under `./data`:
-
-- `skillanything.sqlite3`: profiles, posts, segments, skills, jobs, settings, and search index
-- `archive/`: downloaded images, videos, subtitles, and extracted audio
-- `output/`: exported Skill packages
-
-These files can contain copyrighted content, private cookies, API-derived outputs, and local
-credentials. They are intentionally ignored by Git and should not be included in open-source commits.
-
-## Architecture
-
-- `connectors`: platform adapters and routing.
-- `storage`: SQLite repository, jobs, and knowledge index.
-- `extract`: text/media normalization helpers.
-- `distill`: profile-to-skill synthesis.
-- `package`: Skill package writer and linter.
-- `qa`: knowledge-base Q&A.
-- `web`: local FastAPI API and built-in console.
-
-## SkillAnything v1 Workbench
-
-This repository now includes an additive v1 architecture that keeps the old CLI/API compatible while
-adding a clearer three-layer pipeline:
-
-- Data source layer: existing connectors are adapted upward into `SourceDocument` and `Corpus` IR.
-  Custom sources can implement the `SourceAdapter` protocol in `skillanything/sources/base.py`.
-- Distillation layer: `CapabilityDistillationPipeline` turns a corpus into typed `Capability`
-  records. It supports autonomous discovery and user-defined capability extraction through a focus,
-  capability type, and optional schema.
-- Skill packaging layer: `SkillPackExporter` exports the same `SkillPack` IR to `codex-skill`,
-  `openai-skill`, `claude-skill`, `claude-project-bundle`, or `json-ir`.
-
-Core IR and services:
-
-- `skillanything/ir.py`: `SourceDocument`, `Corpus`, `Capability`, `SkillPack`.
-- `skillanything/sources/`: normalized data-source adapter contract.
-- `skillanything/distill/pipeline.py`: capability distillation orchestration.
-- `skillanything/package/exporters/`: multi-platform exporters.
-- `skillanything/storage/repository.py`: additive tables for collection runs, corpora,
-  capabilities, evidence links, skill packs, export artifacts, and richer jobs.
-
-New CLI examples:
-
-```powershell
-sa build-corpus <profile_id> --goal "提取产业链研究方法"
-sa extract-capability <profile_id> "中国 A 股产业链相关性挖掘" --type chain_relevance_mining
-sa capabilities --profile-id <profile_id>
-sa create-pack <capability_id> --target codex-skill --target claude-skill
-sa export-pack <pack_id> --target claude-project-bundle
-```
-
-New v1 API examples:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8091/api/v1/sources/connectors
-
-Invoke-RestMethod -Method Post `
-  -Uri http://127.0.0.1:8091/api/v1/capabilities:extract `
-  -ContentType application/json `
-  -Body '{"profile_id":"<profile_id>","focus":"中国 A 股产业链相关性挖掘","capability_type":"chain_relevance_mining"}'
-
-Invoke-RestMethod -Method Post `
-  -Uri http://127.0.0.1:8091/api/v1/packs/<pack_id>/exports `
-  -ContentType application/json `
-  -Body '{"target":"json-ir"}'
-```
-
-Frontend workbench:
-
-```powershell
-# Backend
-sa ui --host 127.0.0.1 --port 8091
-
-# Frontend
+pytest -q --basetemp .tmp_pytest_run -p no:cacheprovider
 cd frontend
-npm install
-$env:VITE_SKILLANYTHING_API_PROXY="http://127.0.0.1:8091"
-npm run dev
+npm run build
 ```
 
-Open `http://127.0.0.1:5176`. The workbench exposes: new data source, source library, distillation
-workspace, evidence review, Skill library, tasks/logs, and model/API settings.
+当前重点测试覆盖：
+
+- 本地文件到 Skill 包
+- 问答和 focused Skill
+- IR / Capability / SkillPack / 多目标导出
+- Planner 对 `trading_strategy` 的识别和本地蒸馏
+- Planner 对 `marketing_growth` 的识别和本地蒸馏
+
+## 本地数据与安全
+
+默认运行数据写入 `./data`：
+
+- `skillanything.sqlite3`: profile、内容、片段、skills、jobs、settings、IR 和索引。
+- `archive/`: 下载的图片、视频、字幕和音频。
+- `output/`: 导出的 Skill 包。
+
+这些文件可能包含版权内容、Cookie、API 派生输出和本地凭据，不应提交到公开仓库。
+
+本项目不会绕过验证码、付费墙、登录限制或平台反滥用系统。只采集你有权访问和处理的内容。

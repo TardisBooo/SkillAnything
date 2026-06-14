@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from skillanything.config import Settings
 from skillanything.distill.distiller import Distiller
+from skillanything.distill.planner import DistillationPlan, DistillationPlanner
 from skillanything.ir import (
     Capability,
     CapabilityRequest,
@@ -21,6 +22,7 @@ from skillanything.models import DistilledSkill, ProfileBundle
 @dataclass(slots=True)
 class DistillationRun:
     corpus: Corpus
+    plan: DistillationPlan
     skill: DistilledSkill
     capability: Capability
     pack: SkillPack
@@ -41,7 +43,19 @@ class CapabilityDistillationPipeline:
         target_surfaces: list[str] | None = None,
     ) -> DistillationRun:
         corpus = corpus_from_bundle(bundle, goal=goal, item_limit=item_limit)
-        skill = Distiller(self.settings).distill(bundle)
+        plan = DistillationPlanner().plan(
+            bundle,
+            goal=goal,
+            capability_type="analysis_method",
+        )
+        corpus.metadata["distillation_plan"] = plan.to_dict()
+        skill = Distiller(self.settings).distill(
+            bundle,
+            focus=goal or None,
+            plan=plan,
+            capability_type=plan.capability_type,
+            schema=plan.output_schema,
+        )
         capability = capability_from_skill(
             skill,
             corpus_id=corpus.id,
@@ -54,7 +68,13 @@ class CapabilityDistillationPipeline:
             corpus,
             target_surfaces=target_surfaces,
         )
-        return DistillationRun(corpus=corpus, skill=skill, capability=capability, pack=pack)
+        return DistillationRun(
+            corpus=corpus,
+            plan=plan,
+            skill=skill,
+            capability=capability,
+            pack=pack,
+        )
 
     def extract(
         self,
@@ -70,7 +90,20 @@ class CapabilityDistillationPipeline:
             item_limit=item_limit,
             capability_requests=[request],
         )
-        skill = Distiller(self.settings).distill(bundle, focus=request.instructions or request.label)
+        plan = DistillationPlanner().plan(
+            bundle,
+            goal=request.instructions or request.label,
+            capability_type=request.type,
+            schema=request.schema,
+        )
+        corpus.metadata["distillation_plan"] = plan.to_dict()
+        skill = Distiller(self.settings).distill(
+            bundle,
+            focus=request.instructions or request.label,
+            plan=plan,
+            capability_type=request.type,
+            schema=request.schema,
+        )
         capability = capability_from_skill(
             skill,
             corpus_id=corpus.id,
@@ -84,4 +117,10 @@ class CapabilityDistillationPipeline:
             corpus,
             target_surfaces=target_surfaces,
         )
-        return DistillationRun(corpus=corpus, skill=skill, capability=capability, pack=pack)
+        return DistillationRun(
+            corpus=corpus,
+            plan=plan,
+            skill=skill,
+            capability=capability,
+            pack=pack,
+        )

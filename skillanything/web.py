@@ -33,6 +33,7 @@ class CollectRequest(BaseModel):
 
 class DistillRequest(BaseModel):
     item_limit: int = Field(default=200, ge=1, le=1000)
+    goal: str = ""
 
 
 class ExportRequest(BaseModel):
@@ -649,7 +650,7 @@ def ask(profile_id: str, request: AskRequest) -> dict:
 def distill(profile_id: str, request: DistillRequest) -> dict:
     sa = SkillAnythingApp()
     try:
-        skill = sa.distill(profile_id, item_limit=request.item_limit)
+        skill = sa.distill(profile_id, item_limit=request.item_limit, goal=request.goal)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return skill.to_dict()

@@ -9,6 +9,11 @@ from collections import Counter
 from typing import Any
 
 from skillanything.config import Settings
+from skillanything.distill.planner import (
+    DistillationPlan,
+    DistillationPlanner,
+    plan_to_prompt,
+)
 from skillanything.models import Citation, DistilledSkill, ProfileBundle
 from skillanything.utils import stable_id, truncate
 
@@ -17,31 +22,47 @@ class Distiller:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    def distill(self, bundle: ProfileBundle, focus: str | None = None) -> DistilledSkill:
+    def distill(
+        self,
+        bundle: ProfileBundle,
+        focus: str | None = None,
+        *,
+        plan: DistillationPlan | None = None,
+        capability_type: str = "analysis_method",
+        schema: dict[str, Any] | None = None,
+    ) -> DistilledSkill:
+        plan = plan or DistillationPlanner().plan(
+            bundle,
+            goal=focus,
+            capability_type=capability_type,
+            schema=schema,
+        )
         if self.settings.llm_api_key and self.settings.llm_base_url:
             try:
-                return self._distill_with_compatible_chat(bundle, focus=focus)
+                return self._distill_with_compatible_chat(bundle, focus=focus, plan=plan)
             except Exception as exc:
-                fallback = self._distill_locally(bundle, focus=focus)
+                fallback = self._distill_locally(bundle, focus=focus, plan=plan)
                 fallback.metadata["model_error"] = f"{type(exc).__name__}: {exc}"
                 return fallback
         if self.settings.openai_api_key:
             try:
-                return self._distill_with_openai(bundle, focus=focus)
+                return self._distill_with_openai(bundle, focus=focus, plan=plan)
             except Exception as exc:
-                fallback = self._distill_locally(bundle, focus=focus)
+                fallback = self._distill_locally(bundle, focus=focus, plan=plan)
                 fallback.metadata["model_error"] = f"{type(exc).__name__}: {exc}"
                 return fallback
-        return self._distill_locally(bundle, focus=focus)
+        return self._distill_locally(bundle, focus=focus, plan=plan)
 
     def _distill_with_compatible_chat(
         self,
         bundle: ProfileBundle,
         focus: str | None = None,
+        plan: DistillationPlan | None = None,
     ) -> DistilledSkill:
+        plan = plan or DistillationPlanner().plan(bundle, goal=focus)
         model = self.settings.llm_model or self.settings.model or "qwen3-vl-plus"
         corpus = self._corpus(bundle, max_items=80, max_chars=60000)
-        prompt = self._distill_prompt(corpus, focus=focus)
+        prompt = self._distill_prompt(corpus, focus=focus, plan=plan)
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
@@ -61,19 +82,22 @@ class Distiller:
             distiller="openai_compatible_chat",
             model=model,
             focus=focus,
+            plan=plan,
         )
 
     def _distill_with_openai(
         self,
         bundle: ProfileBundle,
         focus: str | None = None,
+        plan: DistillationPlan | None = None,
     ) -> DistilledSkill:
         from openai import OpenAI
 
+        plan = plan or DistillationPlanner().plan(bundle, goal=focus)
         client = OpenAI(api_key=self.settings.openai_api_key)
         model = self.settings.model or "gpt-5-mini"
         corpus = self._corpus(bundle, max_items=40, max_chars=30000)
-        prompt = self._distill_prompt(corpus, focus=focus)
+        prompt = self._distill_prompt(corpus, focus=focus, plan=plan)
         response = client.responses.create(
             model=model,
             input=prompt,
@@ -86,6 +110,7 @@ class Distiller:
             distiller="openai",
             model=model,
             focus=focus,
+            plan=plan,
         )
 
     def _skill_from_model_data(
@@ -95,23 +120,30 @@ class Distiller:
         distiller: str,
         model: str,
         focus: str | None = None,
+        plan: DistillationPlan | None = None,
     ) -> DistilledSkill:
+        plan = plan or DistillationPlanner().plan(bundle, goal=focus)
         citations = self._citations(bundle)
         model_reports = _as_research_reports(data.get("research_reports"))
-        local_reports = self._research_reports(bundle)
+        local_reports = self._research_reports(bundle, plan=plan)
         research_reports = _merge_reports(model_reports, local_reports)
-        title_focus = f" {focus.strip()}" if focus and focus.strip() else ""
         return DistilledSkill(
-            id=stable_id(bundle.profile.id, "skill", focus or "", data.get("summary", "")),
+            id=stable_id(
+                bundle.profile.id,
+                "skill",
+                plan.id,
+                data.get("summary", ""),
+            ),
             profile_id=bundle.profile.id,
-            title=f"{_profile_name(bundle)}{title_focus} Skill",
+            title=plan.skill_name_hint,
             version="0.1.0",
-            summary=str(data.get("summary") or "Profile-derived analysis skill."),
-            principles=_as_str_list(data.get("principles"))[:12],
-            workflow=_as_str_list(data.get("workflow"))[:12],
-            style_rules=_as_str_list(data.get("style_rules"))[:12],
-            blindspots=_as_str_list(data.get("blindspots"))[:12],
-            eval_cases=_as_eval_cases(data.get("eval_cases")),
+            summary=str(data.get("summary") or _summary_from_plan(bundle, plan)),
+            principles=_as_str_list(data.get("principles"))[:12]
+            or _principles_from_plan(plan, self._keywords(_bundle_text(bundle))),
+            workflow=_as_str_list(data.get("workflow"))[:12] or _workflow_from_plan(plan),
+            style_rules=_as_str_list(data.get("style_rules"))[:12] or _style_rules_from_plan(plan),
+            blindspots=_as_str_list(data.get("blindspots"))[:12] or plan.guardrails[:8],
+            eval_cases=_as_eval_cases(data.get("eval_cases")) or _eval_cases_from_plan(plan),
             citations=citations,
             metadata={
                 "distiller": distiller,
@@ -121,112 +153,70 @@ class Distiller:
                 "comment_count": len(bundle.comments),
                 "research_reports": research_reports,
                 "focus": focus or "",
+                "domain": plan.domain,
+                "capability_type": plan.capability_type,
+                "distillation_plan": plan.to_dict(),
             },
         )
 
     @staticmethod
-    def _distill_prompt(corpus: str, focus: str | None = None) -> str:
-        focus_line = (
-            f"本次只围绕这个主题提取可复用 Skill：{focus.strip()}。\n"
-            if focus and focus.strip()
-            else ""
-        )
+    def _distill_prompt(
+        corpus: str,
+        focus: str | None = None,
+        plan: DistillationPlan | None = None,
+    ) -> str:
+        focus_line = f"User goal: {focus.strip()}\n" if focus and focus.strip() else ""
+        plan_text = plan_to_prompt(plan) if plan else "Distillation plan: infer from evidence."
         return (
-            "你是一个研究型 AI Skill 架构师。基于以下公开内容证据，蒸馏出一个可供 "
-            "agent 调用的分析 Skill。不要冒充作者本人，只提炼方法论、信息源偏好、"
-            "推理流程、表达规则和盲区。先逐条内容归纳研究主题、核心问题、指标、"
-            "工具、数据传导链和结论，再抽象成稳定方法论。\n"
+            "You are a general-purpose AI Skill distillation planner and builder. "
+            "Use the public evidence below to extract a reusable capability for an agent. "
+            "Do not impersonate the source creator. Do not force the corpus into a finance, "
+            "macro, marketing, trading, research, writing, or education template unless the "
+            "plan and evidence support it. Separate observed evidence from inferred reusable "
+            "procedure, and preserve uncertainty.\n"
             f"{focus_line}"
-            "必须只输出 JSON 对象，不要输出 Markdown。字段如下："
-            "summary, principles, workflow, style_rules, blindspots, "
-            "research_reports, eval_cases。\n"
-            "principles/workflow/style_rules/blindspots 都是字符串数组。"
-            "research_reports 是数组，每项包含 title, source_url, question, "
-            "indicators, tools, transmission_chain, conclusion。"
-            "eval_cases 是数组，每项包含 name, input, expected_behavior。\n\n"
-            f"证据语料：\n{corpus}"
+            f"{plan_text}\n\n"
+            "Return only a JSON object, no Markdown. Required fields: "
+            "summary, principles, workflow, style_rules, blindspots, research_reports, eval_cases.\n"
+            "principles/workflow/style_rules/blindspots must be string arrays. "
+            "research_reports must be an array of objects with title, source_url, question, "
+            "indicators, tools, transmission_chain, conclusion. "
+            "eval_cases must be an array of objects with name, input, expected_behavior.\n\n"
+            f"Evidence corpus:\n{corpus}"
         )
 
     def _distill_locally(
         self,
         bundle: ProfileBundle,
         focus: str | None = None,
+        plan: DistillationPlan | None = None,
     ) -> DistilledSkill:
-        corpus_text = "\n".join(item.text for item in bundle.items if item.text)
+        plan = plan or DistillationPlanner().plan(bundle, goal=focus)
+        corpus_text = _bundle_text(bundle)
         keywords = self._keywords(corpus_text)
         top_items = bundle.items[: min(8, len(bundle.items))]
-        profile_name = _profile_name(bundle)
-        focus_phrase = f"围绕“{focus}”" if focus else ""
-        summary = (
-            f"{profile_name} 的 Skill 由 {len(bundle.items)} 条内容、"
-            f"{len(bundle.segments)} 个文本片段和 {len(bundle.assets)} 个媒体资产蒸馏而来。"
-            f"{focus_phrase}本地 fallback 无法替代云模型深度理解，但可提供可运行的 Skill 包骨架。"
-        )
-        topic_phrase = "、".join(keywords[:6]) if keywords else "宏观、市场、风险、政策、估值"
-        principles = [
-            f"围绕高频主题建立分析框架：{topic_phrase}。",
-            "优先把观点拆成事实、推理、结论和风险提示四段。",
-            "保留原始证据引用，不把单条内容泛化为稳定规律。",
-            "遇到市场预测时同时输出基准情景、乐观情景和风险情景。",
-            "对强结论标注证据强度和可能失效条件。",
-        ]
-        workflow = [
-            "读取用户问题并识别资产类别、时间尺度和宏观变量。",
-            "检索 references/evidence.json 中的相似内容和引用片段。",
-            "抽取相关事实、政策变量、资金变量、情绪变量和价格变量。",
-            "按因果链组织推理，区分已发生事实和主观判断。",
-            "输出结论、关键监测指标、反证条件和后续观察清单。",
-        ]
-        style_rules = [
-            "表达保持研究员口吻，避免绝对化预测。",
-            "重要判断后给出证据来源或说明证据不足。",
-            "使用项目符号输出多情景分析，便于快速扫描。",
-            "不声称自己就是原作者，不复制原作者身份或私密经历。",
-        ]
-        blindspots = [
-            "公开主页内容可能存在幸存者偏差和删改缺口。",
-            "短帖和评论更容易受市场情绪影响，不能单独作为方法论证据。",
-            "缺少付费内容、私域社群或实时交易记录时，不推断其完整投资体系。",
-            "音视频自动转写可能产生错字，需要对关键数字和专有名词回听核验。",
-        ]
-        eval_cases = [
-            {
-                "name": "宏观观点拆解",
-                "input": "请按该 Skill 的方式分析一次降息对权益市场的影响。",
-                "expected_behavior": "输出事实、传导链、受益/受损资产、风险情景和证据不足说明。",
-            },
-            {
-                "name": "证据约束",
-                "input": "这个分析师是否一定看多某个行业？",
-                "expected_behavior": "拒绝无证据的绝对归因，引用已有内容并说明置信度。",
-            },
-            {
-                "name": "反证条件",
-                "input": "如果当前判断失败，应该观察哪些反证信号？",
-                "expected_behavior": "列出政策、价格、成交、盈利和情绪方面的失效条件。",
-            },
-        ]
-        citations = self._citations(bundle)
-        research_reports = self._research_reports(bundle)
+        summary = _summary_from_plan(bundle, plan)
         if top_items:
             titles = "; ".join(truncate(item.title, 40) for item in top_items[:3])
-            summary += f" 代表内容包括：{titles}。"
+            summary += f" Representative source items: {titles}."
+        citations = self._citations(bundle)
+        research_reports = self._research_reports(bundle, plan=plan)
         return DistilledSkill(
             id=stable_id(
                 bundle.profile.id,
                 "local",
-                focus or "",
+                plan.id,
                 ",".join(item.id for item in top_items),
             ),
             profile_id=bundle.profile.id,
-            title=f"{profile_name} {focus or 'Macro Analysis'} Skill",
+            title=plan.skill_name_hint,
             version="0.1.0",
             summary=summary,
-            principles=principles,
-            workflow=workflow,
-            style_rules=style_rules,
-            blindspots=blindspots,
-            eval_cases=eval_cases,
+            principles=_principles_from_plan(plan, keywords),
+            workflow=_workflow_from_plan(plan),
+            style_rules=_style_rules_from_plan(plan),
+            blindspots=plan.guardrails[:8],
+            eval_cases=_eval_cases_from_plan(plan),
             citations=citations,
             metadata={
                 "distiller": "local_fallback",
@@ -236,6 +226,9 @@ class Distiller:
                 "comment_count": len(bundle.comments),
                 "research_reports": research_reports,
                 "focus": focus or "",
+                "domain": plan.domain,
+                "capability_type": plan.capability_type,
+                "distillation_plan": plan.to_dict(),
             },
         )
 
@@ -304,17 +297,24 @@ class Distiller:
             "可以",
             "没有",
             "一个",
-            "市场",
             "今天",
             "就是",
             "不是",
             "还是",
+            "with",
+            "from",
+            "that",
+            "this",
+            "into",
         }
-        counts = Counter(token for token in tokens if token not in stop)
+        counts = Counter(token for token in tokens if token.lower() not in stop)
         return [token for token, _ in counts.most_common(20)]
 
     @staticmethod
-    def _research_reports(bundle: ProfileBundle) -> list[dict[str, Any]]:
+    def _research_reports(
+        bundle: ProfileBundle,
+        plan: DistillationPlan | None = None,
+    ) -> list[dict[str, Any]]:
         segments_by_item: dict[str, list[str]] = {}
         for segment in bundle.segments:
             segments_by_item.setdefault(segment.item_id, []).append(segment.text)
@@ -326,10 +326,10 @@ class Distiller:
                 {
                     "title": item.title,
                     "source_url": item.url,
-                    "question": _infer_question(item.title, evidence),
-                    "indicators": _infer_indicators(evidence, keywords),
-                    "tools": _infer_tools(evidence),
-                    "transmission_chain": _infer_chain(evidence),
+                    "question": _infer_question(item.title, evidence, plan=plan),
+                    "indicators": _infer_indicators(evidence, keywords, plan=plan),
+                    "tools": _infer_tools(evidence, plan=plan),
+                    "transmission_chain": _infer_chain(evidence, plan=plan),
                     "conclusion": truncate(evidence, 360),
                 }
             )
@@ -345,6 +345,93 @@ class Distiller:
         if match:
             return json.loads(match.group(0))
         raise ValueError("model did not return a JSON object")
+
+
+def _summary_from_plan(bundle: ProfileBundle, plan: DistillationPlan) -> str:
+    profile_name = _profile_name(bundle)
+    goal = f" for `{plan.goal}`" if plan.goal else ""
+    return (
+        f"{profile_name} {plan.capability_type} Skill is distilled from "
+        f"{len(bundle.items)} public items, {len(bundle.segments)} text segments, "
+        f"and {len(bundle.assets)} media assets{goal}. The planner classified the corpus as "
+        f"`{plan.domain}` and produced a reusable extraction plan with confidence "
+        f"{plan.confidence:.2f}. Local fallback output is a runnable skeleton; model-backed "
+        "distillation can deepen the procedure while preserving the same plan."
+    )
+
+
+def _principles_from_plan(plan: DistillationPlan, keywords: list[str]) -> list[str]:
+    topic_phrase = ", ".join(keywords[:8]) if keywords else ", ".join(plan.extraction_targets[:5])
+    principles = [
+        f"Extract only the reusable `{plan.capability_type}` behavior supported by source evidence.",
+        f"Use the planner targets as the capability boundary: {', '.join(plan.extraction_targets[:8])}.",
+        f"Treat high-frequency source themes as clues, not proof: {topic_phrase}.",
+        "Separate source-observed facts, inferred procedure, and user-facing recommendation.",
+        "Attach evidence or uncertainty labels to every strong rule.",
+    ]
+    return _dedupe([*principles, *plan.evidence_questions[:4]])[:12]
+
+
+def _workflow_from_plan(plan: DistillationPlan) -> list[str]:
+    workflow: list[str] = []
+    for task in plan.tasks:
+        questions = "; ".join(task.evidence_questions[:2])
+        suffix = f" Evidence questions: {questions}." if questions else ""
+        workflow.append(f"{task.title}: {task.purpose}.{suffix}")
+    workflow.extend(
+        [
+            f"Structure the final answer around these axes: {', '.join(plan.workflow_axes)}.",
+            "Before applying the Skill to a new case, state required inputs and missing evidence.",
+            "After producing output, run guardrail checks and mark low-confidence steps.",
+        ]
+    )
+    return _dedupe(workflow)[:12]
+
+
+def _style_rules_from_plan(plan: DistillationPlan) -> list[str]:
+    rules = [
+        f"Write for {plan.audience}.",
+        f"Use style constraints from the plan: {', '.join(plan.style_axes)}.",
+        "Prefer concrete procedures over creator-personality imitation.",
+        "Quote or cite source evidence when explaining where a rule came from.",
+        "When evidence is thin, say what cannot be inferred.",
+    ]
+    return _dedupe(rules)[:12]
+
+
+def _eval_cases_from_plan(plan: DistillationPlan) -> list[dict[str, str]]:
+    cases: list[dict[str, str]] = []
+    for index, scenario in enumerate(plan.eval_scenarios[:6], 1):
+        cases.append(
+            {
+                "name": f"{plan.domain} scenario {index}",
+                "input": scenario,
+                "expected_behavior": (
+                    f"Apply the `{plan.capability_type}` workflow, cite relevant evidence, "
+                    "state assumptions, and refuse unsupported inferences."
+                ),
+            }
+        )
+    if not cases:
+        cases.append(
+            {
+                "name": "evidence constrained use",
+                "input": "Apply this Skill to a new case with incomplete evidence.",
+                "expected_behavior": "State assumptions, missing evidence, reusable steps, and limits.",
+            }
+        )
+    return cases
+
+
+def _bundle_text(bundle: ProfileBundle) -> str:
+    parts: list[str] = []
+    for item in bundle.items:
+        parts.extend([item.title, item.text])
+    for segment in bundle.segments:
+        parts.append(segment.text)
+    for comment in bundle.comments:
+        parts.append(comment.text)
+    return "\n".join(part for part in parts if part)
 
 
 def _as_str_list(value: Any) -> list[str]:
@@ -437,54 +524,61 @@ def _chat_text(data: dict[str, Any]) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
-def _infer_question(title: str, evidence: str) -> str:
-    if "传导链" in title or "传导" in evidence:
-        return "多重宏观/市场数据如何通过传导链影响资产价格与交易准备？"
-    if "看空" in title:
-        return "为什么看空观点更容易获得传播，如何校正情绪偏差？"
-    if "利率" in title:
-        return "利率期限结构如何映射增长、通胀、流动性和资产定价？"
-    if "HBM" in title or "CPU" in title or "DRAM" in title:
-        return "半导体产业数据如何影响供需、竞争格局和估值判断？"
-    return f"如何分析：{truncate(title, 80)}"
+def _infer_question(
+    title: str,
+    evidence: str,
+    *,
+    plan: DistillationPlan | None = None,
+) -> str:
+    if plan and plan.evidence_questions:
+        return plan.evidence_questions[0]
+    if title.strip():
+        return f"What reusable capability pattern is demonstrated by `{truncate(title, 80)}`?"
+    if evidence.strip():
+        return "What reusable capability pattern is demonstrated by this evidence?"
+    return "What capability can be extracted from the source?"
 
 
-def _infer_indicators(evidence: str, keywords: list[str]) -> list[str]:
-    candidates = [
-        "利率",
-        "期限结构",
-        "通胀",
-        "就业",
-        "美元",
-        "流动性",
-        "成交量",
-        "波动率",
-        "期权",
-        "标普",
-        "盈利预期",
-        "库存",
-        "DRAM",
-        "NAND",
-        "HBM",
-        "CPU",
-    ]
-    found = [item for item in candidates if item.lower() in evidence.lower()]
-    return list(dict.fromkeys(found + keywords[:8]))[:12]
+def _infer_indicators(
+    evidence: str,
+    keywords: list[str],
+    *,
+    plan: DistillationPlan | None = None,
+) -> list[str]:
+    planned = plan.extraction_targets if plan else []
+    visible = [item for item in planned if item.lower() in evidence.lower()]
+    return _dedupe([*visible, *planned[:6], *keywords[:8]])[:12]
 
 
-def _infer_tools(evidence: str) -> list[str]:
-    tools = []
-    for candidate in ["option", "期权", "量化", "回测", "期限结构", "数据看板", "产业链图谱"]:
-        if candidate.lower() in evidence.lower():
-            tools.append(candidate)
-    return tools or ["多指标交叉验证", "情景分析", "反证条件检查"]
+def _infer_tools(
+    evidence: str,
+    *,
+    plan: DistillationPlan | None = None,
+) -> list[str]:
+    tools = list(plan.workflow_axes if plan else [])
+    if re.search(r"\bjson\b|schema|表格|模板|清单|checklist", evidence, re.I):
+        tools.append("structured template")
+    if re.search(r"复盘|review|iteration|迭代", evidence, re.I):
+        tools.append("review loop")
+    if re.search(r"评论|comment|用户|audience", evidence, re.I):
+        tools.append("audience feedback")
+    return _dedupe(tools)[:10] or ["evidence review", "procedure extraction", "guardrail check"]
 
 
-def _infer_chain(evidence: str) -> str:
-    if "传导链" in evidence:
-        return "先定位数据变量，再判断变量方向，经由政策/流动性/盈利/风险偏好传导到资产价格。"
-    if "利率" in evidence:
-        return "利率与期限结构影响贴现率和风险偏好，再传导到权益估值、风格和仓位。"
-    if "期权" in evidence or "option" in evidence.lower():
-        return "期权定价、波动率和仓位结构反映市场预期，再反向影响短期价格路径。"
-    return "事实数据 -> 变量关系 -> 市场机制 -> 情景结论 -> 反证条件。"
+def _infer_chain(
+    evidence: str,
+    *,
+    plan: DistillationPlan | None = None,
+) -> str:
+    if plan and plan.workflow_axes:
+        return " -> ".join(plan.workflow_axes)
+    return "source evidence -> repeated pattern -> reusable rule -> output -> guardrail check"
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        clean = str(value).strip()
+        if clean and clean not in result:
+            result.append(clean)
+    return result

@@ -150,11 +150,17 @@ class SkillAnythingApp:
         )
         return result
 
-    def distill(self, profile_id: str, item_limit: int = 200) -> DistilledSkill:
+    def distill(
+        self,
+        profile_id: str,
+        item_limit: int = 200,
+        goal: str = "",
+    ) -> DistilledSkill:
         self.init()
         bundle = self.repo.load_bundle(profile_id, item_limit=item_limit)
         run = CapabilityDistillationPipeline(self.settings).discover(
             bundle,
+            goal=goal,
             item_limit=item_limit,
             target_surfaces=["codex-skill", "openai-skill", "claude-skill"],
         )
